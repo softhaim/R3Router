@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-이거가 GRPO gold-action(ga) 기준 마스킹 버전
-GRU-seq Router (BERT768) — 간소화판 (경량 특성판)  [patched, SG-aware]
-
-변경 요약
-- 라벨 소스 선택: --label_source {auto|sample_gold|teacher}
-  * auto(기본): sample_gold가 있으면 그걸 쓰고, 없으면 teacher_label 사용
-  * sample_gold: 항상 sample_gold만 사용 (없으면 해당 에피소드는 teacher로 폴백)
-  * teacher: 항상 teacher_label만 사용 (기존과 동일)
-- 배치 클래스 비율: --dist_mode {legacy|data|balanced}
-  * legacy(기본): 기존 규칙(소량 D/E 상향) 유지 — GSM8K 기존 성능 보존
-  * data: 데이터의 실제 분포로 배치 구성
-  * balanced: 1/3 균등
-- CSQA(mcqa/csqa) 컨텍스트: query.question + query.choices 를 [CTX]에 포함
-- sample_gold 파싱 호환성: sample_gold | sampleGold | samplegold 모두 지원
-  * {"step_idx": int, "action": "Escalate@Model"} 형태 기대, 유효성 검증 및 경고 출력
-"""
 
 import os, re, json, math, random, argparse, copy, types, csv, datetime
 os.environ["CUDA_VISIBLE_DEVICES"]=os.environ.get("CUDA_VISIBLE_DEVICES","2")
