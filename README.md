@@ -1,4 +1,3 @@
-Here’s a concise, paper-submission–style README in English.
 
 ---
 
