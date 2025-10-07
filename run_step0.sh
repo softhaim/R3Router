@@ -43,7 +43,7 @@ echo "========== Step0 config =========="
 echo "PY=$PY"
 echo "TASK=$TASK"
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-echo "[CSQA] TOTAL=$CSQA_TOTAL, SEED=$CSQA_SEED, OUT=$OUT_CSQA, BANK=$BANK_CSQA"
+echo "[CSQA]  TOTAL=$CSQA_TOTAL, SEED=$CSQA_SEED, OUT=$OUT_CSQA, BANK=$BANK_CSQA"
 echo "[GSM8K] TOTAL=$GSM_TOTAL, SEED=$GSM_SEED, OUT=$OUT_GSM, BANK=$BANK_GSM"
 echo "==================================="
 
@@ -83,10 +83,11 @@ run_gsm8k() {
     --bank_dump "$BANK_GSM"
 
   if (( remain > 0 )); then
-    echo "[GSM8K] Phase 2/2 — main with retrieval (num=$remain)"
+    echo "[GSM8K] Phase 2/2 — main with retrieval (offset=$GSM_SEED, num=$remain)"
     python "$PY" \
       --task gsm8k \
       --num_samples "$remain" \
+      --gsm_offset "$GSM_SEED" \
       --out "$OUT_GSM" \
       --ret_bank "$BANK_GSM" \
       --bank_dump "$BANK_GSM"
