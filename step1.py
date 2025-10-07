@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, json, math, random, argparse, copy, types, csv, datetime
+import os, re, json, math, random, argparse, copy, types, csv, datetime, zlib
 os.environ["CUDA_VISIBLE_DEVICES"]=os.environ.get("CUDA_VISIBLE_DEVICES","2")
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple, Optional
@@ -15,10 +15,8 @@ from torch.nn.utils.rnn import pack_padded_sequence
 from transformers import AutoTokenizer, AutoModel
 from torch.amp import autocast
 from torch.cuda.amp import GradScaler
-import zlib
 
-
-# ----------------- Basics -----------------
+# ================= Basics =================
 ACTIONS = ["Continue", "Detract", "Escalate"]
 SEED_DEFAULT = 42
 
@@ -43,10 +41,7 @@ def forbid_slm_on_de(mdl_logits: torch.Tensor,
                      act_ids: torch.Tensor,
                      slm_idx: int = 0,
                      neg_inf: float = None):
-    """
-    act_ids != 0 (D/E)인 샘플에서 SLM 로그릿을 큰 음수로 마스킹.
-    AMP(FP16)에서도 안전하도록 dtype-aware로 값을 정한다.
-    """
+    """ D/E 예측에서 SLM(인덱스 0) 선택 못하게 큰 음수로 마스킹 """
     out = mdl_logits.clone()
     if out.numel() == 0:
         return out
@@ -54,15 +49,12 @@ def forbid_slm_on_de(mdl_logits: torch.Tensor,
     if not mask.any():
         return out
     if neg_inf is None:
-        if out.dtype in (torch.float16, torch.half):
-            neg_inf = -1e4  # FP16 안전 범위
-        else:
-            neg_inf = -1e9
+        neg_inf = -1e4 if out.dtype in (torch.float16, torch.half) else -1e9
     neg_val = out.new_tensor(neg_inf)
     out[mask, slm_idx] = neg_val
     return out
 
-# ----------------- Data types -----------------
+# ================= Data types =================
 @dataclass
 class StepItem:
     idx: int
@@ -78,10 +70,8 @@ class Episode:
     problem_text: str
     steps: List[StepItem]
     solution: Optional[str]
-    # sample_gold (선택)
     sg_step_idx: Optional[int] = None
-    sg_action: Optional[str] = None  # "Action@Model"
-    # mcqa/csqa 전용 컨텍스트
+    sg_action: Optional[str] = None
     question_ctx: Optional[str] = None
 
 @dataclass
@@ -97,7 +87,7 @@ class TrainSample:
     valid_models_by_action: np.ndarray
     split: str
 
-# ----------------- IO & parsing -----------------
+# ================= IO & parsing =================
 def read_jsonl(paths: List[str]) -> List[Dict[str, Any]]:
     out=[]
     for p in paths:
@@ -122,24 +112,15 @@ def _resolve_sample_gold(obj: Dict[str, Any]) -> Tuple[Optional[int], Optional[s
     for k in ["sample_gold", "sampleGold", "samplegold"]:
         if isinstance(obj.get(k), dict):
             cand = obj[k]; break
-    if not isinstance(cand, dict):
-        return None, None
-
-    idx = cand.get("step_idx")  # <-- None일 수 있음
+    if not isinstance(cand, dict): return None, None
+    idx = cand.get("step_idx")
     act = cand.get("action")
-    if not isinstance(act, str) or "@" not in act:
-        return None, None
-
-    # PATCH: Continue에서 step_idx가 None이면 0으로 간주(베이스라인 체인 시작 시점)
+    if not isinstance(act, str) or "@" not in act: return None, None
     if not isinstance(idx, int):
         a_name, _ = split_teacher_label(act)
-        if a_name == "Continue":
-            idx = 0
-        else:
-            return None, None
-
+        if a_name == "Continue": idx = 0
+        else: return None, None
     return int(idx), act.strip()
-
 
 def parse_episodes(raw_objs: List[Dict[str, Any]], allowed_models: List[str]) -> List[Episode]:
     def map_model(name: str) -> str:
@@ -150,8 +131,6 @@ def parse_episodes(raw_objs: List[Dict[str, Any]], allowed_models: List[str]) ->
     for obj in raw_objs:
         q = obj.get("query", {}) or {}
         task = (obj.get("task") or "").lower()
-
-        # 문제/컨텍스트
         qctx = _mcqa_ctx_from_query(q) if task in ["mcqa","csqa"] else ""
         problem = normalize(q.get("problem") or "") or qctx
 
@@ -171,14 +150,10 @@ def parse_episodes(raw_objs: List[Dict[str, Any]], allowed_models: List[str]) ->
                 )
             )
 
-        # sample_gold 파싱 (호환)
         sg_idx, sg_act = _resolve_sample_gold(obj)
         if isinstance(sg_act, str) and "@" in sg_act:
             a_tmp, m_tmp = split_teacher_label(sg_act)
-            if a_tmp in ACTIONS:
-                sg_act = f"{a_tmp}@{map_model(m_tmp)}"
-            else:
-                sg_act = None  # 불명 라벨은 무시
+            sg_act = f"{a_tmp}@{map_model(m_tmp)}" if a_tmp in ACTIONS else None
 
         if steps:
             eps.append(Episode(
@@ -193,7 +168,7 @@ def parse_episodes(raw_objs: List[Dict[str, Any]], allowed_models: List[str]) ->
             ))
     return eps
 
-# ----------------- Step extraction -----------------
+# ================= Step extraction =================
 def extract_action_text(step: StepItem, key: str) -> str:
     blob = step.actions_blob.get(key) or {}
     txt = (safe_get(blob, "step_output_text", "") or safe_get(blob, "step_answer_only", "") or "").strip()
@@ -202,10 +177,7 @@ def extract_action_text(step: StepItem, key: str) -> str:
     return txt
 
 def extract_slm_signals(step: StepItem, slm_key="Continue@SLM") -> np.ndarray:
-    """
-    경량 SLM 품질 신호 (5차원):
-      [format_ok, ans_is_numeric, digit_ratio, eq_ratio, token_len]
-    """
+    """ 간단한 SLM 품질 신호(5D) """
     blob = step.actions_blob.get(slm_key) or {}
     format_ok = 1.0 if bool(blob.get("format_ok")) else 0.0
     ans_is_numeric = 1.0 if bool(blob.get("ans_is_numeric")) else 0.0
@@ -217,7 +189,7 @@ def extract_slm_signals(step: StepItem, slm_key="Continue@SLM") -> np.ndarray:
     token_len = float(len(s.split()))
     return np.array([format_ok, ans_is_numeric, digit_ratio, eq_ratio, token_len], dtype=np.float32)
 
-# ----------------- Acceptable sets -----------------
+# ================= Acceptable sets =================
 def build_valid_action_mask(step: StepItem) -> np.ndarray:
     mask = np.zeros(3, dtype=np.float32)
     for key,blob in (step.actions_blob or {}).items():
@@ -252,15 +224,15 @@ def build_valid_model_mask_all(step: StepItem, allowed_models: List[str]) -> np.
         out[a_idx,:] = build_valid_model_mask_for_action(step, allowed_models, a_idx)
     return out
 
-# ----------------- Build samples -----------------
+# ================= Build samples =================
 def build_train_samples(eps: List[Episode], allowed_models: List[str],
                         split_ratios=(0.7,0.15,0.15), seed=42,
                         label_source: str = "auto"):
     """
     label_source:
-      - "auto": sample_gold 있으면 그걸 사용, 없으면 teacher_label 사용 (권장)
-      - "sample_gold": 항상 sample_gold만 사용 (없으면 teacher로 폴백)
-      - "teacher": 항상 teacher_label만 사용 (기존과 동일)
+      - "auto": sample_gold 있으면 사용, 없으면 teacher 사용
+      - "sample_gold": sample_gold만 사용(없으면 teacher 폴백)
+      - "teacher": teacher만 사용
     """
     rng=random.Random(seed); rng.shuffle(eps)
     N=len(eps)
@@ -268,11 +240,7 @@ def build_train_samples(eps: List[Episode], allowed_models: List[str],
     marks=(["train"]*n_tr)+(["dev"]*n_dv)+(["test"]*n_te)
     model2idx={m:i for i,m in enumerate(allowed_models)}
 
-    # 통계/경고용 카운터
-    sg_present = 0
-    sg_used = 0
-    sg_model_miss = 0
-    sg_idx_miss = 0
+    sg_present = 0; sg_used = 0; sg_model_miss = 0; sg_idx_miss = 0
 
     def pick_steps(ep: Episode) -> List[StepItem]:
         nonlocal sg_used, sg_idx_miss
@@ -284,27 +252,23 @@ def build_train_samples(eps: List[Episode], allowed_models: List[str],
                     target = st; break
             if target is None:
                 sg_idx_miss += 1
-                return ep.steps  # 폴백
+                return ep.steps
             sg_used += 1
             return [target]
         else:
             return ep.steps
 
-    # sg 존재 카운트
     for ep in eps:
         if ep.sg_action is not None and ep.sg_step_idx is not None:
             sg_present += 1
 
     tr=[]; dv=[]; te=[]
     for ep,sp in zip(eps, marks):
-        # 문제/질문+선지 컨텍스트
         ctx = ep.problem_text or ep.question_ctx or (ep.steps[0].context if ep.steps else "")
-
         chosen_steps = pick_steps(ep)
-        for t, step in enumerate(chosen_steps):
+        for step in chosen_steps:
             units=[]
             if ctx: units.append("[CTX] " + ctx)
-            # 이전 step 히스토리(원본 ep.steps 기준으로 step.idx 이전까지만)
             prev_hist = [s for s in ep.steps if s.idx < step.idx]
             for prev in prev_hist:
                 qa = "[Q] " + (prev.subq or "(no-subq)")
@@ -315,12 +279,10 @@ def build_train_samples(eps: List[Episode], allowed_models: List[str],
             slm_text = extract_action_text(step, "Continue@SLM")
             units.append(q_text + ("\n[A_SLM] " + slm_text if slm_text else ""))
 
-            # 금라벨 결정
             if (label_source in ["sample_gold","auto"]) and (ep.sg_action and ep.sg_step_idx == step.idx):
                 a_str, m_str = split_teacher_label(ep.sg_action)
                 if m_str not in allowed_models:
                     sg_model_miss += 1
-                    # 허용 모델이 아니면 teacher로 폴백
                     a_str, m_str = split_teacher_label(step.teacher_label)
             else:
                 a_str, m_str = split_teacher_label(step.teacher_label)
@@ -336,7 +298,7 @@ def build_train_samples(eps: List[Episode], allowed_models: List[str],
             sample = TrainSample(units, q_text, slm_sig, step.idx, ga, gm, vact, vmdl_gold, vmdl_all, sp)
             (tr if sp=="train" else dv if sp=="dev" else te).append(sample)
 
-            # teacher 모드일 때만 Escalate에서 에피소드 종료(기존 유지)
+            # teacher 모드에서만 Escalate로 에피소드 중단(과거 호환)
             if (label_source == "teacher") and (a_str=="Escalate"):
                 break
 
@@ -348,49 +310,37 @@ def build_train_samples(eps: List[Episode], allowed_models: List[str],
     print(f"Data sizes (flattened): train={len(tr)} dev={len(dv)} test={len(te)}")
     print(f"[label_source] mode = {label_source}")
     dist("train",tr); dist("dev",dv); dist("test",te)
-
-    # sample_gold 진단 출력
     if sg_present:
         print(f"[SG] episodes with sample_gold present: {sg_present}/{len(eps)}")
     if label_source in ["auto","sample_gold"]:
         print(f"[SG] used sample_gold episodes: {sg_used} (idx_miss={sg_idx_miss}, model_not_allowed={sg_model_miss})")
-
     return tr,dv,te
 
-# ----------------- AUX features (경량 6차원) -----------------
+# ================= AUX features (6D) =================
 UNITS_RE = re.compile(r"\b(cm|mm|km|kg|g|miles?|hours?|mins?|seconds?|percent|%)\b", re.I)
 NUM_RE   = re.compile(r"\b\d+(\.\d+)?\b")
-
 EQ_KWS = ["equation","system","integral","derivative"]
 REASON_KWS = ["prove","show","explain","why"]
 
 def aux_vec_from_qtext(q_text: str) -> np.ndarray:
-    """
-    6-D AUX:
-      [numbers_ratio, units_flag, ops_ratio, avg_token_len, has_eq_kw, has_reason_kw]
-    """
-    s = (q_text or "").replace("[Q]", "").strip()
-    s_lower = s.lower()
-    tokens = s_lower.split(); T = max(1, len(tokens))
-    chars = list(s_lower); L = max(1, len(chars))
-
-    numbers_ratio = float(len(NUM_RE.findall(s_lower)))/T
-    units_flag    = 1.0 if UNITS_RE.search(s_lower) else 0.0
+    """ 6-D AUX: [numbers_ratio, units_flag, ops_ratio, avg_token_len, has_eq_kw, has_reason_kw] """
+    s = (q_text or "").replace("[Q]", "").strip().lower()
+    tokens = s.split(); T = max(1, len(tokens))
+    chars = list(s); L = max(1, len(chars))
+    numbers_ratio = float(len(NUM_RE.findall(s)))/T
+    units_flag    = 1.0 if UNITS_RE.search(s) else 0.0
     ops_ratio     = sum(c in "+-*/=^" for c in chars)/L
     avg_toklen    = (np.mean([len(t) for t in tokens]) if tokens else 0.0)
-    has_eq_kw     = 1.0 if any(k in s_lower for k in EQ_KWS) else 0.0
-    has_reason_kw = 1.0 if any(k in s_lower for k in REASON_KWS) else 0.0
-
+    has_eq_kw     = 1.0 if any(k in s for k in EQ_KWS) else 0.0
+    has_reason_kw = 1.0 if any(k in s for k in REASON_KWS) else 0.0
     return np.array([numbers_ratio, units_flag, ops_ratio, avg_toklen, has_eq_kw, has_reason_kw], dtype=np.float32)
 
-def aux_dim_reduced() -> int:
-    return 6
-
+def aux_dim_reduced() -> int: return 6
 def batch_aux_features(q_texts: List[str]) -> torch.Tensor:
     arr = np.stack([aux_vec_from_qtext(t) for t in q_texts], axis=0)
     return torch.from_numpy(arr)
 
-# ----------------- Encoders -----------------
+# ================= Encoders =================
 class MeanPooler(nn.Module):
     def forward(self, last_hidden, attn_mask):
         m = attn_mask.unsqueeze(-1).float()
@@ -401,10 +351,7 @@ class BertEncoder(nn.Module):
         super().__init__()
         self.max_len = max_len
         self.pool = MeanPooler()
-        # LRU 캐시 (CPU float16 저장)
-        self._cache = OrderedDict()
-        self._cache_cap = 50000
-
+        self._cache = OrderedDict(); self._cache_cap = 50000
         try:
             self.tok = AutoTokenizer.from_pretrained(name, use_fast=True, local_files_only=local_files_only)
         except Exception as e:
@@ -419,10 +366,8 @@ class BertEncoder(nn.Module):
             for p in self.bert.parameters(): p.requires_grad=False
 
     def _cache_put(self, key: str, vec: torch.Tensor):
-        self._cache[key] = vec
-        self._cache.move_to_end(key)
-        if len(self._cache) > self._cache_cap:
-            self._cache.popitem(last=False)
+        self._cache[key] = vec; self._cache.move_to_end(key)
+        if len(self._cache) > self._cache_cap: self._cache.popitem(last=False)
 
     def encode_texts(self, texts: List[str], device):
         result: List[Optional[torch.Tensor]] = [None]*len(texts)
@@ -431,7 +376,7 @@ class BertEncoder(nn.Module):
             v = self._cache.get(t)
             if v is not None:
                 self._cache.move_to_end(t)
-                result[i] = v  # CPU float16
+                result[i] = v
             else:
                 miss_indices.append(i); miss_texts.append(t)
 
@@ -444,11 +389,10 @@ class BertEncoder(nn.Module):
             for idx, vec in zip(miss_indices, pooled_cpu):
                 self._cache_put(texts[idx], vec)
                 result[idx] = vec
-
         Z = torch.stack([r for r in result], dim=0).to(device=device, dtype=torch.float32)
         return Z  # [B,768]
 
-# ----------------- Router -----------------
+# ================= Router =================
 class GRURouter(nn.Module):
     def __init__(self, num_models, aux_dim, slm_sig_dim,
                  bert_name="bert-base-uncased", max_len=384,
@@ -463,7 +407,6 @@ class GRURouter(nn.Module):
         self.model_vecs = nn.Parameter(torch.randn(num_models, 768)*0.02)
         self.sim_temp   = nn.Parameter(torch.tensor(0.7))
 
-        # 현재/과거 문맥 + sim 특성(3) + AUX + SLM + step_emb
         self._aux_dim = int(aux_dim)
         self._slm_dim = int(slm_sig_dim)
         cur_in = 768 + 768 + 3 + self._aux_dim + self._slm_dim + step_emb_dim
@@ -477,7 +420,6 @@ class GRURouter(nn.Module):
         self.act_head = nn.Linear(proj_dim, 3)
         self.mdl_head = nn.Linear(proj_dim, num_models)
 
-        # feature standardization buffers
         self.register_buffer("aux_mean", torch.zeros(self._aux_dim))
         self.register_buffer("aux_std", torch.ones(self._aux_dim))
         self.register_buffer("slm_mean", torch.zeros(self._slm_dim))
@@ -534,14 +476,12 @@ class GRURouter(nn.Module):
         sim_min = sims.min(1, keepdim=True).values
         sim_ent = -(prob * prob.log()).sum(1, keepdim=True)
 
-        # AUX
         if self.aux_mean.numel() > 0:
             aux = batch_aux_features(q_texts).to(device).float()
             aux = (aux - self.aux_mean) / self.aux_std
         else:
             aux = torch.zeros((B,0), device=device)
 
-        # SLM signals
         if self.slm_mean.numel() > 0:
             slm_sigs = (slm_sigs_in.float() - self.slm_mean) / self.slm_std
         else:
@@ -557,7 +497,7 @@ class GRURouter(nn.Module):
         mdl_logits = self.mdl_head(fused)
         return act_logits, mdl_logits
 
-# ----------------- Collate & iters -----------------
+# ================= Collate & iters =================
 def collate(samples: List[TrainSample], device):
     units=[s.unit_texts for s in samples]
     qtexts=[s.q_text for s in samples]
@@ -588,43 +528,7 @@ def iter_eval_batches(N: int, batch_size: int):
     for i in range(0, N, batch_size):
         yield list(range(i, min(i+batch_size, N)))
 
-# ----------------- Logit Adjustment -----------------
-def build_la_bias_from_freqs(freqs: List[float], tau: float, device) -> Optional[torch.Tensor]:
-    if tau is None or tau <= 0.0: return None
-    p = torch.tensor(freqs, device=device).clamp_min(1e-6)
-    bias = -float(tau) * p.log()
-    return bias  # shape [3]
-
-def focal_ce(logits, target, weight=None, gamma: float = 1.5):
-    logp = F.log_softmax(logits, dim=1); p = logp.exp()
-    mod = (1 - p).pow(gamma)
-    return F.nll_loss(mod * logp, target, weight=weight, reduction="mean")
-
-def apply_action_biases(act_logits: torch.Tensor, la_bias: Optional[torch.Tensor]) -> torch.Tensor:
-    return act_logits + la_bias.view(1,-1) if la_bias is not None else act_logits
-
-# Macro-F1 surrogate (Dice)
-def soft_macro_f1_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    p = F.softmax(logits, dim=1)
-    B, C = p.size()
-    losses = []
-    for c in range(C):
-        y = (target == c).float()
-        pc = p[:, c]
-        tp = (pc * y).sum()
-        fp = (pc * (1.0 - y)).sum()
-        fn = ((1.0 - pc) * y).sum()
-        f1 = (2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)
-        losses.append(1.0 - f1)
-    return torch.stack(losses).mean()
-
-def sum_biases(b1: Optional[torch.Tensor], b2: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    if (b1 is None) and (b2 is None): return None
-    if b1 is None: return b2
-    if b2 is None: return b1
-    return b1 + b2
-
-# ----------------- Eval helpers -----------------
+# ================= Eval helpers =================
 @torch.no_grad()
 def evaluate(model, samples, model_names, device, batch_size=16,
              la_bias: Optional[torch.Tensor]=None):
@@ -635,47 +539,37 @@ def evaluate(model, samples, model_names, device, batch_size=16,
         batch=[samples[i] for i in idxs]
         units,qtexts,slm,step,ga,gm,_,_,_=collate(batch, device)
         act_logits, mdl_logits = model(units,qtexts,slm,step)
-        act_logits = apply_action_biases(act_logits, la_bias)
+        if la_bias is not None: act_logits = act_logits + la_bias.view(1,-1)
         pa = act_logits.argmax(1)
-        blended = mdl_logits
-        blended = forbid_slm_on_de(blended, pa, slm_idx=0)
+        blended = forbid_slm_on_de(mdl_logits, pa, slm_idx=0)
         pm = blended.argmax(1)
         pm = torch.where(pa==0, torch.zeros_like(pm), pm)
-
         gold_a += ga.cpu().tolist(); pred_a += pa.cpu().tolist()
         gold_m += gm.cpu().tolist(); pred_m += pm.cpu().tolist()
 
     M = int(model.mdl_head.out_features)
-    if not isinstance(model_names, (list, tuple)) or len(model_names) != M:
-        names = [ (model_names[i] if isinstance(model_names,(list,tuple)) and i < len(model_names) else f"m{i}") for i in range(M) ]
-    else:
-        names = list(model_names)
-
+    names = list(model_names) if isinstance(model_names,(list,tuple)) and len(model_names)==M else [f"m{i}" for i in range(M)]
     mat_a = np.zeros((3,3), dtype=int)
     mat_m = np.zeros((M,M), dtype=int)
     for g,p in zip(gold_a,pred_a): mat_a[g,p] += 1
     for g,p in zip(gold_m,pred_m):
-        if 0 <= g < M and 0 <= p < M:
-            mat_m[g,p] += 1
+        if 0 <= g < M and 0 <= p < M: mat_m[g,p] += 1
     hist={0:0,1:0,2:0}
     for x in pred_a: hist[x]+=1
     act_acc = (np.array(gold_a)==np.array(pred_a)).mean() if N else 0.0
     mdl_acc = (np.array(gold_m)==np.array(pred_m)).mean() if N else 0.0
     joint   = np.mean([ (ga==pa) and (gm==pm) for (ga,gm),(pa,pm) in zip(zip(gold_a,gold_m), zip(pred_a,pred_m)) ]) if N else 0.0
-
     print(f"[pred action dist] C={hist[0]} D={hist[1]} E={hist[2]}")
     print("Confusion (ACTION gold×pred):")
     print(f"{'':15s}{'Continue':12s}{'Detract':12s}{'Escalate':12s}")
     for i,r in enumerate(["Continue","Detract","Escalate"]):
         print(f"{r:15s}{mat_a[i,0]:<12d}{mat_a[i,1]:<12d}{mat_a[i,2]:<12d}")
-
     head="".join([f"{n[:14]:14s}" for n in names])
     print("Confusion (MODEL gold×pred):")
     print(f"{'':15s}{head}")
     for i,n in enumerate(names):
         row="".join([f"{mat_m[i,j]:<14d}" for j in range(M)])
         print(f"{n[:14]:15s}{row}")
-
     # Macro-F1
     def f1_macro(gold, pred, num_classes=3):
         gold = np.array(gold); pred = np.array(pred)
@@ -689,92 +583,40 @@ def evaluate(model, samples, model_names, device, batch_size=16,
             f1 = 2*precision*recall/(precision+recall+1e-9)
             f1s.append(f1)
         return float(np.mean(f1s)), f1s
-
     f1_macro_all, f1_each = f1_macro(gold_a, pred_a, 3)
     print(f"[ACTION Macro-F1] macro={f1_macro_all:.4f} | per-class (C/D/E) = {np.round(f1_each,4)}")
-
     return act_acc, mdl_acc, joint
-
-@torch.no_grad()
-def evaluate_extended(model, samples, model_names, device, batch_size=16,
-                      la_bias: Optional[torch.Tensor]=None):
-    model.eval()
-    N=len(samples)
-    gold_a=[]; gold_m=[]
-    pred_a=[]; pred_m=[]
-    soft_a=[]; soft_joint=[]; route_ok_list=[]
-    for idxs in iter_eval_batches(N, batch_size):
-        batch=[samples[i] for i in idxs]
-        units,qtexts,slm,step,ga,gm,vact,_,vmdl_all = collate(batch, device)
-        act_logits, mdl_logits = model(units,qtexts,slm,step)
-        act_logits = apply_action_biases(act_logits, la_bias)
-        pa = act_logits.argmax(1)
-        blended = mdl_logits
-        blended = forbid_slm_on_de(blended, pa, slm_idx=0)
-        pm = blended.argmax(1)
-        pm = torch.where(pa==0, torch.zeros_like(pm), pm)
-
-        rows = torch.arange(pa.size(0), device=pa.device)
-        ok_a = vact[rows, pa].bool()
-        ok_m = vmdl_all[rows, pa, pm].bool()
-        ok_joint = ok_a & ( (pa==0) | ok_m )
-        route_ok = vmdl_all[rows, pa, pm].bool()
-
-        route_ok_list += route_ok.cpu().tolist()
-        soft_a += ok_a.cpu().tolist()
-        soft_joint += ok_joint.cpu().tolist()
-        gold_a += ga.cpu().tolist(); gold_m += gm.cpu().tolist()
-        pred_a += pa.cpu().tolist(); pred_m += pm.cpu().tolist()
-
-    gold_a = np.array(gold_a); gold_m=np.array(gold_m)
-    pred_a = np.array(pred_a); pred_m=np.array(pred_m)
-    soft_a = np.array(soft_a); soft_joint=np.array(soft_joint)
-    route_rate = np.array(route_ok_list).mean() if N else 0.0
-
-    gold_act_acc = (gold_a==pred_a).mean() if N else 0.0
-    gold_joint   = np.mean((gold_a==pred_a) & (gold_m==pred_m)) if N else 0.0
-    soft_act_acc = soft_a.mean() if N else 0.0
-    soft_joint_acc = soft_joint.mean() if N else 0.0
-
-    print(f"[EVAL+soft] gold_act={gold_act_acc:.4f} gold_joint={gold_joint:.4f}  soft_act={soft_act_acc:.4f} soft_joint={soft_joint_acc:.4f}  route_ok={route_rate:.4f}")
 
 @torch.no_grad()
 def compute_metrics(model, samples, model_names, device, batch_size=16,
                     la_bias: Optional[torch.Tensor]=None):
     model.eval()
     N=len(samples)
-    gold_a=[]; gold_m=[]
-    pred_a=[]; pred_m=[]
-    soft_a=[]; soft_joint=[]; route_ok_list=[]
+    gold_a=[]; gold_m=[]; pred_a=[]; pred_m=[]; soft_a=[]; soft_joint=[]; route_ok_list=[]
     for idxs in iter_eval_batches(N, batch_size):
         batch=[samples[i] for i in idxs]
         units,qtexts,slm,step,ga,gm,vact,_,vmdl_all = collate(batch, device)
         act_logits, mdl_logits = model(units,qtexts,slm,step)
-        act_logits = apply_action_biases(act_logits, la_bias)
+        if la_bias is not None: act_logits = act_logits + la_bias.view(1,-1)
         pa = act_logits.argmax(1)
-        blended = mdl_logits
-        blended = forbid_slm_on_de(blended, pa, slm_idx=0)
+        blended = forbid_slm_on_de(mdl_logits, pa, slm_idx=0)
         pm = blended.argmax(1)
         pm = torch.where(pa==0, torch.zeros_like(pm), pm)
-
         rows = torch.arange(pa.size(0), device=pa.device)
         ok_a = vact[rows, pa].bool()
         ok_m = vmdl_all[rows, pa, pm].bool()
         ok_joint = ok_a & ( (pa==0) | ok_m )
         route_ok = vmdl_all[rows, pa, pm].bool()
-
         route_ok_list += route_ok.cpu().tolist()
         soft_a += ok_a.cpu().tolist()
         soft_joint += ok_joint.cpu().tolist()
         gold_a += ga.cpu().tolist(); gold_m += gm.cpu().tolist()
         pred_a += pa.cpu().tolist(); pred_m += pm.cpu().tolist()
-
     gold_a=np.array(gold_a); gold_m=np.array(gold_m)
     pred_a=np.array(pred_a); pred_m=np.array(pred_m)
     soft_a=np.array(soft_a); soft_joint=np.array(soft_joint)
     route_ok=np.array(route_ok_list)
-
-    # macro-F1 for action
+    # macro-F1
     f1s=[]
     for c in range(3):
         tp=np.sum((gold_a==c)&(pred_a==c))
@@ -783,7 +625,6 @@ def compute_metrics(model, samples, model_names, device, batch_size=16,
         precision=tp/(tp+fp+1e-9); recall=tp/(tp+fn+1e-9)
         f1=2*precision*recall/(precision+recall+1e-9)
         f1s.append(f1)
-
     return {
         "gold_action_acc": float((gold_a==pred_a).mean()) if N else 0.0,
         "gold_joint_acc": float(np.mean((gold_a==pred_a)&(gold_m==pred_m))) if N else 0.0,
@@ -793,7 +634,7 @@ def compute_metrics(model, samples, model_names, device, batch_size=16,
         "action_macro_f1": float(np.mean(f1s))
     }
 
-# ----------------- Loss utils -----------------
+# ================= Loss utils (공용) =================
 def soft_ce_from_masks(logits, gold_idx, valid_mask, gold_weight=0.8):
     B,C = logits.size()
     tgt = torch.zeros_like(logits, dtype=torch.float)
@@ -820,7 +661,7 @@ def kl_penalty(new_logits, old_logits):
     kl = (p_new * (logp_new - logp_old)).sum(1)
     return kl.mean()
 
-# ----------------- Feature stats & init -----------------
+# ================= Feature stats & init =================
 def compute_feature_stats(samples: List[TrainSample], use_aux: bool, use_slm: bool):
     if use_aux:
         AUX=np.stack([aux_vec_from_qtext(s.q_text) for s in samples],0)
@@ -859,11 +700,10 @@ def init_biases_from_label_stats(model, tr_samples, model_names, device):
 
 @torch.no_grad()
 def initialize_from_data(model, samples: List[TrainSample], device, max_batches=300, batch_size=24):
-    """모델 벡터 초기화(간단): non-Continue에서 모델별 평균 q_emb로 seed."""
+    """ non-Continue에서 모델별 평균 q_emb로 model_vecs 초기화 """
     model.eval()
     K = model.model_vecs.size(0)
-    sums = [None]*K; cnts=[0]*K
-    taken=0
+    sums = [None]*K; cnts=[0]*K; taken=0
     for i in range(0, min(len(samples), max_batches*batch_size), batch_size):
         batch=samples[i:i+batch_size]
         units=[s.unit_texts for s in batch]
@@ -872,15 +712,14 @@ def initialize_from_data(model, samples: List[TrainSample], device, max_batches=
         step=torch.tensor([s.step_idx for s in batch], dtype=torch.long, device=device)
         ga = torch.tensor([s.gold_action for s in batch], dtype=torch.long, device=device)
         gm = torch.tensor([s.gold_model for s in batch], dtype=torch.long, device=device)
+        model(units,qtexts,slm,step)  # forward to warm caches
 
-        act_logits, mdl_logits = model(units,qtexts,slm,step)
-
-        # q-embedding 추출
+        # 재인코딩: 마지막 unit 임베딩
         flat=[]; offsets=[0]
         for units_i in units:
             flat += units_i; offsets.append(offsets[-1]+len(units_i))
         Z = model.enc.encode_texts(flat, device=device)
-        chunks=[]
+        chunks=[]; 
         for j in range(len(units)):
             a=offsets[j]; b=offsets[j+1]
             chunks.append(Z[a:b])
@@ -897,14 +736,13 @@ def initialize_from_data(model, samples: List[TrainSample], device, max_batches=
                     cnts[k] += 1
         taken += len(batch)
         if taken >= max_batches*batch_size: break
-
     with torch.no_grad():
         for k in range(K):
             if cnts[k]>0:
                 vec = sums[k]/cnts[k]
                 model.model_vecs[k].copy_(vec.to(model.model_vecs.device))
 
-# ----------------- SFT -----------------
+# ================= SFT =================
 def lock_per_to_batch(B, pc, pd, pe, min_c=4, min_d=3, min_e=3):
     tot = pc+pd+pe
     if tot != B:
@@ -920,12 +758,7 @@ def lock_per_to_batch(B, pc, pd, pe, min_c=4, min_d=3, min_e=3):
     return max(min_c,pc), max(min_d,pd), max(min_e,pe)
 
 def compute_batch_mix(B: int, freqs: Tuple[float,float,float], mode: str):
-    """
-    mode:
-      - 'legacy': 기존 규칙 유지 (D/E 하한 10%, 1.25배 가중)
-      - 'data':   데이터 분포 그대로
-      - 'balanced': 1/3 균등
-    """
+    """ legacy/data/balanced """
     pC, pD, pE = freqs
     if mode == "balanced":
         pc, pd, pe = B/3, B/3, B - 2*(B/3)
@@ -936,8 +769,6 @@ def compute_batch_mix(B: int, freqs: Tuple[float,float,float], mode: str):
         pe = max(3, int(B*max(0.10, pE*1.25)))
         pc = max(4, B - pd - pe)
         return lock_per_to_batch(B, pc, pd, pe, min_c=4, min_d=3, min_e=3)
-
-    # 정수화 및 합 맞추기
     pc, pd, pe = int(round(pc)), int(round(pd)), int(round(pe))
     pc = max(1, pc); pd = max(1, pd); pe = max(1, pe)
     while pc+pd+pe < B:
@@ -951,24 +782,40 @@ def compute_batch_mix(B: int, freqs: Tuple[float,float,float], mode: str):
         else: break
     return pc, pd, pe
 
+def build_la_bias_from_freqs(freqs: List[float], tau: float, device) -> Optional[torch.Tensor]:
+    if tau is None or tau <= 0.0: return None
+    p = torch.tensor(freqs, device=device).clamp_min(1e-6)
+    bias = -float(tau) * p.log()
+    return bias
+
+def soft_macro_f1_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    p = F.softmax(logits, dim=1)
+    B, C = p.size()
+    losses = []
+    for c in range(C):
+        y = (target == c).float()
+        pc = p[:, c]
+        tp = (pc * y).sum()
+        fp = (pc * (1.0 - y)).sum()
+        fn = ((1.0 - pc) * y).sum()
+        f1 = (2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)
+        losses.append(1.0 - f1)
+    return torch.stack(losses).mean()
+
 def train_sft(model, tr, dv, te, model_names, device, cfg, train_dist=None):
-    # Optimizer
     no_decay = ["bias", "LayerNorm.weight"]
     bert_named = list(model.enc.bert.named_parameters())
     bert_decay    = [p for n,p in bert_named if not any(nd in n for nd in no_decay)]
     bert_no_decay = [p for n,p in bert_named if any(nd in n for nd in no_decay)]
     other_params  = [p for n,p in model.named_parameters() if not n.startswith("enc.bert")]
-
     opt = torch.optim.AdamW([
         {"params": bert_decay,    "lr": 2e-5, "weight_decay": 0.01},
         {"params": bert_no_decay, "lr": 2e-5, "weight_decay": 0.00},
         {"params": other_params,  "lr": 3e-4, "weight_decay": 1e-2},
     ])
-
     use_amp = (device.type == "cuda")
     scaler = GradScaler(enabled=use_amp)
 
-    # class weights & freqs
     counts={"Continue":0,"Detract":0,"Escalate":0}
     for s in tr: counts[ACTIONS[s.gold_action]] += 1
     tot = sum(counts.values())+1e-9
@@ -977,7 +824,6 @@ def train_sft(model, tr, dv, te, model_names, device, cfg, train_dist=None):
     w_act = torch.tensor(inv, dtype=torch.float32, device=device); w_act = w_act / w_act.sum() * 3.0
     la_bias = build_la_bias_from_freqs(freqs, 0.5, device)
 
-    # losses (고정)
     ce_act = nn.CrossEntropyLoss(weight=w_act)
     ce_mdl = nn.CrossEntropyLoss(reduction="none")
     rdrop_lambda = 0.01
@@ -987,7 +833,6 @@ def train_sft(model, tr, dv, te, model_names, device, cfg, train_dist=None):
     gold_weight_action = 0.9
     gold_weight_model  = 0.9
 
-    # 배치 비율
     B = cfg.batch_size
     if train_dist is None:
         pC, pD, pE = freqs
@@ -1005,55 +850,47 @@ def train_sft(model, tr, dv, te, model_names, device, cfg, train_dist=None):
         for idxs in iter_weighted_batches(tr, per_c, per_d, per_e, iters_per_epoch):
             batch=[tr[i] for i in idxs]
             units,qtexts,slm,step,ga,gm,vact,vmdl,vmdl_all=collate(batch, device)
-
-            # two passes (R-Drop)
             with autocast('cuda', enabled=use_amp):
                 act1, mdl1 = model(units,qtexts,slm,step)
                 act2, mdl2 = model(units,qtexts,slm,step)
 
-            act1b = apply_action_biases(act1, la_bias).float()
-            act2b = apply_action_biases(act2, la_bias).float()
+            act1b = (act1 + la_bias.view(1,-1)).float()
+            act2b = (act2 + la_bias.view(1,-1)).float()
 
-            # Action CE(hard+soft)
             loss_act_hard = 0.5*(ce_act(act1b, ga)+ce_act(act2b, ga))
             loss_act_soft = 0.5*(soft_ce_from_masks(act1b, ga, vact, gold_weight_action) +
                                  soft_ce_from_masks(act2b, ga, vact, gold_weight_action))
             loss_act = (1.0-soft_target_weight)*loss_act_hard + soft_target_weight*loss_act_soft
 
-            # Margin(D/E vs C)
             d_margin = F.relu(margin_m - (act1b[:,1]-act1b[:,0])) + F.relu(margin_m - (act2b[:,1]-act2b[:,0]))
             e_margin = F.relu(margin_m - (act1b[:,2]-act1b[:,0])) + F.relu(margin_m - (act2b[:,2]-act2b[:,0]))
             loss_margin_de = (d_margin*(ga==1).float() + e_margin*(ga==2).float())*.5
 
-            # 대칭 C-margin
-            margin_c = 0.10
-            margin_lambda_c = 0.05
+            margin_c = 0.10; margin_lambda_c = 0.05
             c_gap1 = act1b[:,0] - torch.stack([act1b[:,1], act1b[:,2]], dim=1).max(1).values
             c_gap2 = act2b[:,0] - torch.stack([act2b[:,1], act2b[:,2]], dim=1).max(1).values
             c_margin = F.relu(margin_c - c_gap1) + F.relu(margin_c - c_gap2)
             loss_margin_c = (c_margin * (ga==0).float())
             loss_margin = loss_margin_de.mean() * margin_lambda + loss_margin_c.mean() * margin_lambda_c
 
-            # 모델 CE: D/E에서 SLM 금지
             mdl1m = forbid_slm_on_de(mdl1.float(), ga, slm_idx=0)
             mdl2m = forbid_slm_on_de(mdl2.float(), ga, slm_idx=0)
             mask_nc = (ga!=0).float()
             if mask_nc.sum()>0:
                 rows=torch.arange(ga.size(0), device=ga.device)
                 vmdl_gold_soft = vmdl_all[rows, ga, :]
-                loss_m_h = ((ce_mdl(mdl1m, gm)+ce_mdl(mdl2m, gm))*0.5 * mask_nc).sum() / mask_nc.sum()
+                loss_m_h = ((nn.CrossEntropyLoss(reduction='none')(mdl1m, gm)+
+                             nn.CrossEntropyLoss(reduction='none')(mdl2m, gm))*0.5 * mask_nc).sum() / mask_nc.sum()
                 loss_m_s = 0.5*(soft_ce_from_masks(mdl1m, gm, vmdl_gold_soft, gold_weight_model) +
                                 soft_ce_from_masks(mdl2m, gm, vmdl_gold_soft, gold_weight_model))
                 loss_m = (1.0-soft_target_weight)*loss_m_h + soft_target_weight*loss_m_s
             else:
                 loss_m = torch.tensor(0.0, device=device)
 
-            # R-Drop KL
             p1 = F.log_softmax(act1b, dim=1); q1 = F.softmax(act1b, dim=1)
             p2 = F.log_softmax(act2b, dim=1); q2 = F.softmax(act2b, dim=1)
             loss_rdrop = 0.5*(F.kl_div(p1, q2, reduction="batchmean") + F.kl_div(p2, q1, reduction="batchmean")) * rdrop_lambda
 
-            # Macro-F1 surrogate
             act_avg = 0.5 * (act1b + act2b)
             loss_f1 = soft_macro_f1_loss(act_avg, ga) * macro_gamma
 
@@ -1069,7 +906,6 @@ def train_sft(model, tr, dv, te, model_names, device, cfg, train_dist=None):
         print(f"[SFT] epoch {ep} loss={np.mean(losses):.4f}")
         a,m,j = evaluate(model, dv, model_names, device, batch_size=B, la_bias=la_bias)
         print(f"[SFT-dev@ep{ep}] action_acc={a:.4f} model_acc={m:.4f} joint={j:.4f}")
-        evaluate_extended(model, dv, model_names, device, batch_size=B, la_bias=la_bias)
 
         if j > best_dev["joint"]:
             best_dev = {"joint": j, "state": copy.deepcopy(model.state_dict()), "ep": ep}
@@ -1081,59 +917,12 @@ def train_sft(model, tr, dv, te, model_names, device, cfg, train_dist=None):
     print("== Final SFT Evaluation ==")
     a,m,j = evaluate(model, dv, model_names, device, batch_size=B, la_bias=la_bias)
     print(f"[SFT-dev] action_acc={a:.4f} model_acc={m:.4f} joint={j:.4f}")
-    evaluate_extended(model, dv, model_names, device, batch_size=B, la_bias=la_bias)
     a,m,j = evaluate(model, te, model_names, device, batch_size=B, la_bias=la_bias)
     print(f"[SFT-test] action_acc={a:.4f} model_acc={m:.4f} joint={j:.4f}")
-    evaluate_extended(model, te, model_names, device, batch_size=B, la_bias=la_bias)
 
-    return la_bias  # sft 시 사용한 기본 LA를 RL에서도 사용
+    return la_bias  # SFT 시 사용한 기본 LA를 RL/GRPO에서도 사용
 
-# ----------------- Macro-F1 bias calibration -----------------
-@torch.no_grad()
-def _macro_f1_with_bias(model, samples, device, la_bias: Optional[torch.Tensor], batch_size: int = 32) -> float:
-    model.eval()
-    gold_a, pred_a = [], []
-    N = len(samples)
-    for idxs in iter_eval_batches(N, batch_size):
-        batch = [samples[i] for i in idxs]
-        units,qtexts,slm,step,ga,gm,_,_,_ = collate(batch, device)
-        act_logits, *_ = model(units, qtexts, slm, step)
-        act_logits = apply_action_biases(act_logits, la_bias)
-        pa = act_logits.argmax(1)
-        gold_a += ga.cpu().tolist(); pred_a += pa.cpu().tolist()
-    gold = np.array(gold_a); pred = np.array(pred_a)
-    f1s = []
-    for c in range(3):
-        tp = np.sum((gold==c)&(pred==c))
-        fp = np.sum((gold!=c)&(pred==c))
-        fn = np.sum((gold==c)&(pred!=c))
-        prec = tp/(tp+fp+1e-9); rec = tp/(tp+fn+1e-9)
-        f1s.append(2*prec*rec/(prec+rec+1e-9))
-    return float(np.mean(f1s))
-
-@torch.no_grad()
-def calibrate_macro_biases(model, samples, device,
-                           base_bias: Optional[torch.Tensor] = None,
-                           search_lo: float = -0.8, search_hi: float = 0.8, search_step: float = 0.1) -> torch.Tensor:
-    model.eval()
-    grid = np.arange(search_lo, search_hi + 1e-9, search_step)
-    best = {"score": -1.0, "bias": None, "bd": 0.0, "be": 0.0}
-    base = base_bias.clone().to(device) if isinstance(base_bias, torch.Tensor) else None
-    zero = torch.zeros(3, device=device)
-
-    for bd in grid:
-        for be in grid:
-            add = zero.clone()
-            add[1] = float(bd)   # D
-            add[2] = float(be)   # E
-            cur = sum_biases(base, add)
-            score = _macro_f1_with_bias(model, samples, device, cur)
-            if score > best["score"]:
-                best = {"score": score, "bias": cur.detach().clone(), "bd": bd, "be": be}
-    print(f"[MACRO-CAL] Δbias(D,E)=({best['bd']:+.2f},{best['be']:+.2f}) -> dev Macro-F1={best['score']:.4f}")
-    return best["bias"]
-
-# ----------------- Gold-oriented bias calibration -----------------
+# ================= Bias calibration (Gold metric) =================
 @torch.no_grad()
 def _gold_metric_with_bias(model, samples, device, la_bias: Optional[torch.Tensor], target: str = "joint", batch_size: int = 32):
     metrics = compute_metrics(model, samples, [f"m{i}" for i in range(model.mdl_head.out_features)], device, batch_size=batch_size, la_bias=la_bias)
@@ -1152,14 +941,14 @@ def calibrate_for_gold(model, samples, device,
     for bd in grid:
         for be in grid:
             add = zero.clone(); add[1]=float(bd); add[2]=float(be)
-            cur = sum_biases(base, add)
+            cur = (base + add) if base is not None else add
             score = _gold_metric_with_bias(model, samples, device, cur, target=target, batch_size=32)
             if score > best["score"]:
                 best = {"score": score, "bias": cur.detach().clone(), "bd": bd, "be": be}
     print(f"[GOLD-CAL] target={target} Δbias(D,E)=({best['bd']:+.2f},{best['be']:+.2f}) -> dev {target}={best['score']:.4f}")
     return best["bias"]
 
-# ----------------- RL (Self-Critical A2C) -----------------
+# ================= GRPO =================
 def _sample_from_logits(logits: torch.Tensor, temp: float = 1.0):
     p = F.softmax(logits / max(1e-6, temp), dim=1).clamp(min=1e-8)
     dist = torch.distributions.Categorical(p)
@@ -1169,7 +958,7 @@ def _sample_from_logits(logits: torch.Tensor, temp: float = 1.0):
 
 def _reward_components(pa, pm, ga, gm, vact, vmdl_all):
     """
-    규칙:
+    보상:
       +1.0 if action==gold
       else +0.5 if action acceptable
       +0.7 if (a!=C and model==gold_model)
@@ -1184,14 +973,11 @@ def _reward_components(pa, pm, ga, gm, vact, vmdl_all):
     same_act = (pa == ga).float()
     accept = vact[rows, pa].float()
     base = same_act + (1.0 - same_act) * 0.5 * accept
-
     route_ok = vmdl_all[rows, pa, pm].float() * is_nc.float()
     same_model = ((pm == gm).float()) * is_nc.float()
     add_route = 0.7 * same_model + 0.35 * (1.0 - same_model) * route_ok
-
     false_continue = ((ga != 0) & (pa == 0)).float()
     invalid_route = ((is_nc) & (vmdl_all[rows, pa, pm] < 0.5)).float()
-
     reward = base + add_route - 0.6 * false_continue - 0.3 * invalid_route
     reward = reward + 0.2 * ((ga == 0) & (pa == 0)).float()
     return reward
@@ -1210,157 +996,10 @@ def precompute_anchor_logits(anchor_model, samples: List[TrainSample], device, b
         mdl_buf[idxs] = mdl_l.detach().cpu().to(torch.float16)
     return act_buf, mdl_buf
 
-def train_rl(model, tr, dv, te, model_names, device, cfg, la_bias_eval: Optional[torch.Tensor],
-             anchor_precomputed=None):
-    """
-    Self-Critical A2C:
-      loss = -(adv * logπ) + λ_KL KL(π || π_anchor) + λ_CE CE_guided - λ_H H(π)
-    """
-    # Anchor(고정)
-    if anchor_precomputed is None:
-        anchor = copy.deepcopy(model).eval()
-        for p in anchor.parameters(): p.requires_grad_(False)
-        anchor_act, anchor_mdl = precompute_anchor_logits(anchor, tr, device, batch_size=cfg.batch_size)
-        del anchor
-    else:
-        anchor_act, anchor_mdl = anchor_precomputed
-
-    # Optimizer
-    no_decay = ["bias", "LayerNorm.weight"]
-    bert_named = list(model.enc.bert.named_parameters())
-    bert_decay    = [p for n,p in bert_named if not any(nd in n for nd in no_decay)]
-    bert_no_decay = [p for n,p in bert_named if any(nd in n for nd in no_decay)]
-    other_params  = [p for n,p in model.named_parameters() if not n.startswith("enc.bert")]
-    opt = torch.optim.AdamW([
-        {"params": bert_decay,    "lr": 2e-5, "weight_decay": 0.01},
-        {"params": bert_no_decay, "lr": 2e-5, "weight_decay": 0.00},
-        {"params": other_params,  "lr": 3e-4, "weight_decay": 1e-2},
-    ])
-
-    use_amp = (device.type == "cuda")
-    scaler = GradScaler(enabled=use_amp)
-
-    # class inverse-freq weights (보상에 곱해 사용; 평균≈1)
-    counts = {"Continue":0,"Detract":0,"Escalate":0}
-    for s in tr: counts[ACTIONS[s.gold_action]] += 1
-    tot = sum(counts.values()) + 1e-9
-    freqs = np.array([counts["Continue"]/tot, counts["Detract"]/tot, counts["Escalate"]/tot], dtype=np.float32)
-    inv = 1.0 / np.clip(freqs, 1e-6, None)
-    cls_w = torch.tensor(inv / inv.mean(), device=device).float()
-
-    # 작은 지도신호(안정화)
-    ce_act_guided = nn.CrossEntropyLoss(weight=torch.tensor(inv, device=device).float())
-    ce_mdl_guided = nn.CrossEntropyLoss(reduction="none")
-
-    # 하이퍼
-    T_act, T_mdl = 0.8, 0.8
-    LAMBDA_KL, LAMBDA_CE, LAMBDA_ENT = 0.25, 0.15, 0.01
-    iters_per_epoch = max(120, math.ceil(len(tr)/cfg.batch_size))
-    per_c, per_d, per_e = cfg.per_c, cfg.per_d, cfg.per_e
-
-    best_dev = {"joint": -1, "state": None, "ep": 0}
-
-    for ep in range(1, cfg.epochs_rl+1):
-        model.train()
-        returns=[]; kls=[]
-        for idxs in iter_weighted_batches(tr, per_c, per_d, per_e, iters_per_epoch):
-            batch=[tr[i] for i in idxs]
-            units,qtexts,slm,step,ga,gm,vact,_,vmdl_all=collate(batch, device)
-
-            # 현재 정책
-            with autocast('cuda', enabled=use_amp):
-                act_logits, mdl_logits = model(units,qtexts,slm,step)
-            act_logits_b = apply_action_biases(act_logits, la_bias_eval)
-
-            # 샘플링
-            a, logp_a, _ = _sample_from_logits(act_logits_b, T_act)
-            mdl_logits_masked = forbid_slm_on_de(mdl_logits, a, slm_idx=0)
-            m, logp_m, _ = _sample_from_logits(mdl_logits_masked, T_mdl)
-            logp_total = logp_a + (a != 0).float() * logp_m
-
-            # Anchor (baseline, greedy)
-            a0_logits = anchor_act[idxs].to(device=device, dtype=torch.float32)
-            m0_logits = anchor_mdl[idxs].to(device=device, dtype=torch.float32)
-            a0_logits_b = apply_action_biases(a0_logits, la_bias_eval)
-            a0 = a0_logits_b.argmax(1)
-            m0_logits_masked = forbid_slm_on_de(m0_logits, a0, slm_idx=0)
-            m0 = m0_logits_masked.argmax(1)
-
-            # 보상
-            r_sample = _reward_components(a, m, ga, gm, vact, vmdl_all)
-            r_anchor = _reward_components(a0, m0, ga, gm, vact, vmdl_all)
-
-            # 클래스 가중 보상
-            r_sample = r_sample * cls_w[ga]
-            r_anchor = r_anchor * cls_w[ga]
-
-            # Advantage
-            adv = (r_sample - r_anchor).detach()
-            adv = (adv - adv.mean()) / (adv.std() + 1e-6)
-
-            # Policy loss
-            pg_loss = -(adv * logp_total).mean()
-
-            # KL(π || π_anchor)
-            kl_a = kl_penalty(act_logits_b.float(), a0_logits_b.float())
-            mdl_logits_gold_mask = forbid_slm_on_de(mdl_logits.float(), ga, slm_idx=0)
-            m0_logits_gold_mask  = forbid_slm_on_de(m0_logits.float(),  ga, slm_idx=0)
-            kl_m = kl_penalty(mdl_logits_gold_mask, m0_logits_gold_mask)
-            kl_loss = kl_a + kl_m
-
-            # Guided CE (작게 섞기)
-            ce_a = ce_act_guided(act_logits_b.float(), ga)
-            mask_nc = (ga != 0).float()
-            ce_m = ce_mdl_guided(mdl_logits_gold_mask, gm)
-            ce_m = (ce_m * mask_nc).sum() / (mask_nc.sum() + 1e-6)
-            ce_loss = ce_a + ce_m
-
-            # Entropy 보너스(최대화) → 손실에서 빼기
-            ent_a = entropy_bonus(act_logits_b.float())
-            if (a != 0).any():
-                ent_m = entropy_bonus(mdl_logits_masked[(a != 0)].float())
-            else:
-                ent_m = torch.tensor(0.0, device=device)
-            ent = ent_a + ent_m
-
-            loss = pg_loss + LAMBDA_KL * kl_loss + LAMBDA_CE * ce_loss - LAMBDA_ENT * ent
-
-            opt.zero_grad()
-            scaler.scale(loss).backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
-
-            returns.append(float(r_sample.mean().item()))
-            kls.append(float(kl_loss.item()))
-
-        # Dev 평가
-        a_acc, m_acc, j_acc = evaluate(model, dv, model_names, device, batch_size=cfg.batch_size, la_bias=la_bias_eval)
-        print(f"[RL] epoch {ep} avg_return={np.mean(returns):.4f} avg_KL={np.mean(kls):.4f}")
-        print(f"[RL-dev@ep{ep}] action_acc={a_acc:.4f} model_acc={m_acc:.4f} joint={j_acc:.4f}")
-        evaluate_extended(model, dv, model_names, device, batch_size=cfg.batch_size, la_bias=la_bias_eval)
-
-        if j_acc > best_dev["joint"]:
-            best_dev = {"joint": j_acc, "state": copy.deepcopy(model.state_dict()), "ep": ep}
-
-    if best_dev["state"] is not None:
-        model.load_state_dict(best_dev["state"])
-        print(f"[RL] loaded best dev checkpoint @ epoch {best_dev['ep']} (joint={best_dev['joint']:.4f})")
-
-    print("== Final RL Evaluation ==")
-    a_acc, m_acc, j_acc = evaluate(model, dv, model_names, device, batch_size=cfg.batch_size, la_bias=la_bias_eval)
-    print(f"[RL-dev] action_acc={a_acc:.4f} model_acc={m_acc:.4f} joint={j_acc:.4f}")
-    evaluate_extended(model, dv, model_names, device, batch_size=cfg.batch_size, la_bias=la_bias_eval)
-    a_acc, m_acc, j_acc = evaluate(model, te, model_names, device, batch_size=cfg.batch_size, la_bias=la_bias_eval)
-    print(f"[RL-test] action_acc={a_acc:.4f} model_acc={m_acc:.4f} joint={j_acc:.4f}")
-    evaluate_extended(model, te, model_names, device, batch_size=cfg.batch_size, la_bias=la_bias_eval)
-
 def _repeat_batch_for_group(units, qtexts, slm, step, ga, gm, vact, vmdl_all, G: int):
-    # 리스트/텐서를 그룹 크기만큼 반복
     def _rep_list(L):
         out=[]
-        for x in L:
-            out.extend([x]*G)
+        for x in L: out.extend([x]*G)
         return out
     units_rep  = _rep_list(units)
     qtexts_rep = _rep_list(qtexts)
@@ -1375,65 +1014,41 @@ def _repeat_batch_for_group(units, qtexts, slm, step, ga, gm, vact, vmdl_all, G:
 def _group_advantages(rewards: torch.Tensor, G: int, baseline: str="loo",
                       topk_frac: float=1.0, norm: str="group"):
     """
-    rewards: [B*G]  → internally reshape to [B, G]
-    baseline:
-      - 'loo'  : leave-one-out group mean
-      - 'mean' : group mean
-      - 'topk' : top-k fraction mean per group (k = max(1, round(G*topk_frac)))
-    norm:
-      - 'group': per-group std normalization
-      - 'batch': batch-wise std normalization
-      - 'none' : no normalization
+    rewards: [B*G] → [B,G]로 reshape
+    baseline: 'loo' | 'mean' | 'topk'
+    norm: 'group' | 'batch' | 'none'
     """
     N = rewards.numel()
-    if G <= 0:
-        raise ValueError(f"G must be >=1, got {G}")
+    if G <= 0: raise ValueError(f"G must be >=1, got {G}")
     if N % G != 0:
-        # 남는 샘플이 생긴다면 잘린 그룹이 있다는 뜻 → 가장 보수적으로 남는 꼬리를 제거
         B_eff = N // G
         rewards = rewards[:B_eff * G]
     B = rewards.numel() // G
-
-    # [B, G]로 안전하게 변형
     R = rewards.reshape(B, G)
-
-    # baseline 계산
     if baseline == "loo" and G > 1:
-        sumR = R.sum(dim=1, keepdim=True)          # [B,1]
-        base = (sumR - R) / max(1, G - 1)          # [B,G]
+        sumR = R.sum(dim=1, keepdim=True)
+        base = (sumR - R) / max(1, G - 1)
     elif baseline == "mean":
-        base = R.mean(dim=1, keepdim=True).expand_as(R)  # [B,G]
-    else:  # 'topk'
+        base = R.mean(dim=1, keepdim=True).expand_as(R)
+    else:
         k = max(1, int(round(G * float(topk_frac))))
-        topk_vals, _ = torch.topk(R, k, dim=1, largest=True, sorted=False)  # [B,k]
-        base = topk_vals.mean(dim=1, keepdim=True).expand_as(R)             # [B,G]
-
-    A = (R - base).reshape(B * G).detach()
-
-    # 정규화
+        topk_vals, _ = torch.topk(R, k, dim=1, largest=True, sorted=False)
+        base = topk_vals.mean(dim=1, keepdim=True).expand_as(R)
+    A = (R - base)
     if norm == "group":
-        std = R.std(dim=1, keepdim=True).clamp_min(1e-6)  # [B,1]
-        A = (R - base) / std
-        A = A.reshape(B * G).detach()
+        std = R.std(dim=1, keepdim=True).clamp_min(1e-6)
+        A = (A / std)
     elif norm == "batch":
         stdb = rewards.std().clamp_min(1e-6)
-        A = ((R - base) / stdb).reshape(B * G).detach()
-
-    return A
-
+        A = (A / stdb)
+    return A.reshape(B * G).detach()
 
 def train_grpo(model, tr, dv, te, model_names, device, cfg, la_bias_eval: Optional[torch.Tensor],
                anchor_precomputed=None, args=None):
-    """
-    GRPO (Group Relative Policy Optimization):
-      - 각 샘플을 G번 샘플링하여 그룹 보상 R_{i,1..G}
-      - baseline을 그룹 통계(LOO/평균/Top-k)로 설정 → A_{i,j} = R_{i,j} - baseline_i
-      - 정책 손실: L = - E[ A * log π(a,m|x) ] + β_KL * KL(π || π_ref) + β_CE * CE_guided - β_H * H(π)
-    """
+    """ GRPO (Group Relative Policy Optimization) """
     assert anchor_precomputed is not None, "anchor_precomputed가 필요합니다 (SFT reference 고정 로짓)."
-    anchor_act_all, anchor_mdl_all = anchor_precomputed  # [N,3], [N,K] (float16 on CPU)
+    anchor_act_all, anchor_mdl_all = anchor_precomputed  # CPU float16
 
-    # Optimizer 구성 (SFT와 동일)
     no_decay = ["bias", "LayerNorm.weight"]
     bert_named = list(model.enc.bert.named_parameters())
     bert_decay    = [p for n,p in bert_named if not any(nd in n for nd in no_decay)]
@@ -1444,7 +1059,6 @@ def train_grpo(model, tr, dv, te, model_names, device, cfg, la_bias_eval: Option
         {"params": bert_no_decay, "lr": 2e-5, "weight_decay": 0.00},
         {"params": other_params,  "lr": 3e-4, "weight_decay": 1e-2},
     ])
-
     use_amp = (device.type == "cuda")
     scaler = GradScaler(enabled=use_amp)
 
@@ -1490,48 +1104,48 @@ def train_grpo(model, tr, dv, te, model_names, device, cfg, la_bias_eval: Option
 
             with autocast('cuda', enabled=use_amp):
                 act_logits, mdl_logits = model(units_r, qtexts_r, slm_r, step_r)
-            act_logits_b = apply_action_biases(act_logits, la_bias_eval)
+            if la_bias_eval is not None:
+                act_logits = act_logits + la_bias_eval.view(1, -1)
 
             # 샘플링
-            a, logp_a, _ = _sample_from_logits(act_logits_b, T_act)
+            a, logp_a, _ = _sample_from_logits(act_logits, T_act)
             mdl_logits_masked = forbid_slm_on_de(mdl_logits, a, slm_idx=0)
             m, logp_m, _ = _sample_from_logits(mdl_logits_masked, T_mdl)
             logp_total = logp_a + (a != 0).float() * logp_m  # [B*G]
 
             # 보상
             r = _reward_components(a, m, ga_r, gm_r, vact_r, vmdl_r)  # [B*G]
-            # 클래스 가중 보상
-            r = r * cls_w[ga_r]
+            r = r * cls_w[ga_r]  # 클래스 가중
 
             # 그룹 상대 어드밴티지
             A = _group_advantages(r, G, baseline=BASELINE, topk_frac=TOPK_FRAC, norm=R_NORM)
 
-            # Policy gradient (REINFORCE)
+            # Policy gradient
             pg_loss = -(A * logp_total).mean()
 
             # KL(π || π_ref=SFT) — anchor precomputed 로짓 사용
-            # 앵커 로짓도 그룹 반복에 맞춰 인덱스 확장
             a0_logits = anchor_act_all[idxs].to(device=device, dtype=torch.float32).repeat_interleave(G, dim=0)
             m0_logits = anchor_mdl_all[idxs].to(device=device, dtype=torch.float32).repeat_interleave(G, dim=0)
-            a0_logits_b = apply_action_biases(a0_logits, la_bias_eval)
+            if la_bias_eval is not None:
+                a0_logits = a0_logits + la_bias_eval.view(1, -1)
 
-            kl_a = kl_penalty(act_logits_b.float(), a0_logits_b.float())
+            kl_a = kl_penalty(act_logits.float(), a0_logits.float())
 
-            # 모델 KL은 D/E에서 SLM 금지 마스킹(금라벨 기준)
+            # 모델 KL은 금라벨 기준 SLM 금지
             mdl_logits_gold_mask = forbid_slm_on_de(mdl_logits.float(), ga_r, slm_idx=0)
             m0_logits_gold_mask  = forbid_slm_on_de(m0_logits.float(),  ga_r, slm_idx=0)
             kl_m = kl_penalty(mdl_logits_gold_mask, m0_logits_gold_mask)
             kl_loss = kl_a + kl_m
 
             # 약한 CE (안정화)
-            ce_a = ce_act_guided(act_logits_b.float(), ga_r)
+            ce_a = ce_act_guided(act_logits.float(), ga_r)
             mask_nc = (ga_r != 0).float()
             ce_m = ce_mdl_guided(mdl_logits_gold_mask, gm_r)
             ce_m = (ce_m * mask_nc).sum() / (mask_nc.sum() + 1e-6)
             ce_loss = ce_a + ce_m
 
             # 엔트로피 보너스(최대화 → 손실에서 빼기)
-            ent_a = entropy_bonus(act_logits_b.float())
+            ent_a = entropy_bonus(act_logits.float())
             if (a != 0).any():
                 ent_m = entropy_bonus(mdl_logits_masked[(a != 0)].float())
             else:
@@ -1553,7 +1167,6 @@ def train_grpo(model, tr, dv, te, model_names, device, cfg, la_bias_eval: Option
         a_acc, m_acc, j_acc = evaluate(model, dv, model_names, device, batch_size=cfg.batch_size, la_bias=la_bias_eval)
         print(f"[GRPO] epoch {ep} avg_return={np.mean(returns):.4f} avg_KL={np.mean(kls):.4f}")
         print(f"[GRPO-dev@ep{ep}] action_acc={a_acc:.4f} model_acc={m_acc:.4f} joint={j_acc:.4f}")
-        evaluate_extended(model, dv, model_names, device, batch_size=cfg.batch_size, la_bias=la_bias_eval)
 
         if j_acc > best_dev["joint"]:
             best_dev = {"joint": j_acc, "state": copy.deepcopy(model.state_dict()), "ep": ep}
@@ -1565,21 +1178,24 @@ def train_grpo(model, tr, dv, te, model_names, device, cfg, la_bias_eval: Option
     print("== Final GRPO Evaluation ==")
     a_acc, m_acc, j_acc = evaluate(model, dv, model_names, device, batch_size=cfg.batch_size, la_bias=la_bias_eval)
     print(f"[GRPO-dev] action_acc={a_acc:.4f} model_acc={m_acc:.4f} joint={j_acc:.4f}")
-    evaluate_extended(model, dv, model_names, device, batch_size=cfg.batch_size, la_bias=la_bias_eval)
     a_acc, m_acc, j_acc = evaluate(model, te, model_names, device, batch_size=cfg.batch_size, la_bias=la_bias_eval)
     print(f"[GRPO-test] action_acc={a_acc:.4f} model_acc={m_acc:.4f} joint={j_acc:.4f}")
-    evaluate_extended(model, te, model_names, device, batch_size=cfg.batch_size, la_bias=la_bias_eval)
 
-# ----------------- Config & CLI -----------------
+# ================= Config & CLI =================
 @dataclass
 class SimpleCfg:
     batch_size: int = 16
     epochs_sft: int = 8
     epochs_rl: int  = 6
+    dist_mode: str = "legacy"
+    # filled later
+    per_c: int = 0
+    per_d: int = 0
+    per_e: int = 0
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="GRU-seq Router (경량 특성판)")
-    ap.add_argument("--data", nargs="+", required=True, help="학습 jsonl 파일들 (여러 개 가능)")
+    ap = argparse.ArgumentParser(description="GRU-seq Router (SFT + GRPO)")
+    ap.add_argument("--data", nargs="+", required=True, help="학습 jsonl 파일(들)")
     ap.add_argument("--models", nargs="+", default=["SLM","Qwen/Qwen2.5-7B-Instruct","meta-llama/Llama-3.1-8B-Instruct","Qwen/Qwen2.5-14B-Instruct"])
     ap.add_argument("--bert", default="bert-base-uncased")
     ap.add_argument("--freeze_bert", type=int, default=1)
@@ -1588,124 +1204,39 @@ def parse_args():
     ap.add_argument("--epochs_sft", type=int, default=8)
     ap.add_argument("--epochs_rl", type=int, default=6)
     ap.add_argument("--seed", type=int, default=SEED_DEFAULT)
-    ap.add_argument("--results_csv", default=None, help="결과를 append할 CSV 경로(옵션)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--save_dir", default="ckpts", help="라우터 ckpt 저장 폴더")
-    ap.add_argument("--save_name", default="router_rl_MATH_GRPO.pt", help="최종 RL 베스트 ckpt 파일명")
-    ap.add_argument("--save_sft", type=int, default=1, help="SFT 베스트도 저장할지 여부(1/0)")
-    # NEW:
-    ap.add_argument("--label_source", choices=["auto","sample_gold","teacher"], default="auto",
-                    help="라벨 소스 선택: auto(기본)/sample_gold/teacher")
-    ap.add_argument("--dist_mode", choices=["legacy","data","balanced"], default="legacy",
-                    help="배치 클래스 비율 모드: legacy(기본)/data/balanced")
-    
-    ap.add_argument("--auto_name", type=int, default=1,
-                help="자동 파일명 생성 사용(1)/비활성(0)")
-    ap.add_argument("--sft_name", default=None,
-                help="SFT ckpt 파일명(미지정시 auto_name 로직 적용)")
-    
-        # === RL algorithm & GRPO options ===
-    ap.add_argument("--rl_alg", choices=["a2c","grpo"], default="grpo",
-                    help="RL 알고리즘 선택: a2c(기존), grpo(그룹 상대)")
-    ap.add_argument("--group_size", type=int, default=4,
-                    help="GRPO 그룹당 샘플 수 G")
-    ap.add_argument("--baseline", choices=["loo","mean","topk"], default="loo",
-                    help="GRPO 그룹 베이스라인: loo(기본, leave-one-out), mean, topk")
-    ap.add_argument("--topk_frac", type=float, default=1.0,
-                    help="baseline=topk 일 때 상위 비율(0<frac<=1), 1.0=전체평균")
-    ap.add_argument("--reward_norm", choices=["none","group","batch"], default="group",
-                    help="어드밴티지 정규화 범위")
-    ap.add_argument("--kl_coef", type=float, default=0.25, help="KL 가중치")
-    ap.add_argument("--ce_coef", type=float, default=0.10, help="약한 CE 가중치")
-    ap.add_argument("--ent_coef", type=float, default=0.01, help="엔트로피 보너스 가중치")
+    ap.add_argument("--save_dir", default="ckpts", help="ckpt 저장 폴더")
+    ap.add_argument("--save_name", default="router_rl.pt", help="최종 RL 베스트 ckpt 파일명")
+    ap.add_argument("--sft_name", default=None, help="SFT ckpt 파일명(미지정시 자동)")
+    ap.add_argument("--label_source", choices=["auto","sample_gold","teacher"], default="auto")
+    ap.add_argument("--dist_mode", choices=["legacy","data","balanced"], default="legacy")
 
+    # GRPO options (+ 호환성 위해 --rl_alg 유지)
+    ap.add_argument("--rl_alg", choices=["grpo"], default="grpo")
+    ap.add_argument("--group_size", type=int, default=4)
+    ap.add_argument("--baseline", choices=["loo","mean","topk"], default="loo")
+    ap.add_argument("--topk_frac", type=float, default=1.0)
+    ap.add_argument("--reward_norm", choices=["none","group","batch"], default="group")
+    ap.add_argument("--kl_coef", type=float, default=0.25)
+    ap.add_argument("--ce_coef", type=float, default=0.10)
+    ap.add_argument("--ent_coef", type=float, default=0.01)
 
     return ap.parse_args()
-    
 
-# ----------------- CSV 유틸 -----------------
-def _resolve_results_path(path_or_dir: str) -> Optional[str]:
-    if not path_or_dir:
-        return None
-    p = path_or_dir
-    if os.path.isdir(p):
-        return os.path.join(p, "results.csv")
-    root, ext = os.path.splitext(p)
-    if ext.lower() != ".csv":
-        os.makedirs(p, exist_ok=True)
-        return os.path.join(p, "results.csv")
-    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-    return p
-
-def append_results_csv(path_or_dir: str, row: dict, fields: list):
-    file_path = _resolve_results_path(path_or_dir)
-    if not file_path:
-        return
-    new_file = not os.path.exists(file_path)
-    with open(file_path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        if new_file:
-            w.writeheader()
-        w.writerow(row)
-    print(f"[results] appended to {file_path}")
-
-def _safe_tag(s: str) -> str:
-    # 파일명 안전문자만 남기기
-    return re.sub(r"[^A-Za-z0-9._+\-]+", "-", s).strip("-")
-
-def _shorten(s: str, maxlen: int = 96) -> str:
-    if len(s) <= maxlen:
-        return s
-    digest = f"{zlib.adler32(s.encode('utf-8')):08x}"
-    keep = maxlen - 9  # '-' + 8 hex
-    return f"{s[:keep]}-{digest}"
-
-def _derive_run_tag(args, eps) -> str:
-    # 데이터 파일명들
-    bases = [os.path.splitext(os.path.basename(p))[0] for p in args.data]
-    data_tag = "+".join(sorted(set(bases))) or "data"
-    # 태스크들
-    tasks = sorted(set([(ep.task or "unk").lower() for ep in eps])) or ["mix"]
-    task_tag = "+".join(tasks)
-    # 라벨/비율/시드
-    opt_tag = f"ls-{args.label_source}__dm-{args.dist_mode}__s{args.seed}"
-    tag = "__".join([task_tag, data_tag, opt_tag])
-    return _safe_tag(_shorten(tag, 96))
-
-# ----------------- Main -----------------
+# ================= Main =================
 def main():
     args = parse_args()
+    if getattr(args, "rl_alg", "grpo") != "grpo":
+        print("[warn] --rl_alg은 grpo만 지원합니다. grpo로 강제 설정합니다.")
     set_seed(args.seed)
     device = torch.device(args.device)
 
     raw = read_jsonl(args.data)
     allowed_models = args.models
     print(f"[Vocab] actions= {ACTIONS}")
-    print(f"[Vocab] models= {allowed_models}  SLM_idx=0")
+    print(f"[Vocab] models= {allowed_models}  (SLM_idx=0)")
 
     eps = parse_episodes(raw, allowed_models)
-
-    # ---- 자동 이름 태그 구성 (데이터/태스크/옵션 기반) ----
-    run_tag = _derive_run_tag(args, eps)
-    # RL 저장 이름
-    if int(getattr(args, "auto_name", 1)) == 1:
-        # 사용자가 --save_name을 기본값 그대로 두었으면 자동 이름 사용
-        if (not args.save_name) or (args.save_name == "router_rl_fix.pt"):
-            args.save_name = f"router_rl__{run_tag}.pt"
-    # SFT 저장 이름
-    sft_name = args.sft_name if args.sft_name else (
-        f"router_sft__{run_tag}.pt" if int(getattr(args, "auto_name", 1)) == 1 else "router_sft.pt"
-    )
-
-    print(f"[naming] run_tag={run_tag}")
-    print(f"[naming] sft_ckpt={sft_name}  rl_ckpt={args.save_name}")
-
-
-    # 데이터/라벨 sanity 체크: gold vs sample_gold 혼선 방지용 로그
-    # - CSQA류에서는 query.gold(선지 정답)는 라우팅에는 사용되지 않음
-    has_query_gold = sum(1 for r in raw if isinstance((r.get("query") or {}).get("gold", None), (str,int)))
-    print(f"[sanity] query.gold present in {has_query_gold}/{len(raw)} records (not used for routing).")
-
     tr, dv, te = build_train_samples(
         eps, allowed_models,
         split_ratios=(0.7,0.15,0.15),
@@ -1731,55 +1262,46 @@ def main():
     init_biases_from_label_stats(model, tr, allowed_models, device)
     initialize_from_data(model, tr, device)
 
-    # train SFT
-    cfg = SimpleCfg(batch_size=args.batch_size, epochs_sft=args.epochs_sft, epochs_rl=args.epochs_rl)
-    cfg.dist_mode = args.dist_mode  # NEW
+    # SFT
+    cfg = SimpleCfg(batch_size=args.batch_size, epochs_sft=args.epochs_sft, epochs_rl=args.epochs_rl, dist_mode=args.dist_mode)
     la_bias_sft = train_sft(model, tr, dv, te, allowed_models, device, cfg)
     sft_state = copy.deepcopy(model.state_dict())
 
     # dev 기준 gold_joint 최적화로 Δbias 튜닝
     la_bias_tuned = calibrate_for_gold(model, dv, device, base_bias=la_bias_sft, target="joint")
 
-    # RL용 Anchor 사전계산
+    # RL용 Anchor 사전계산 (SFT 고정본)
     anchor_model = copy.deepcopy(model).eval()
-    for p in anchor_model.parameters():
-        p.requires_grad_(False)
+    for p in anchor_model.parameters(): p.requires_grad_(False)
     anchor_pre = precompute_anchor_logits(anchor_model, tr, device, batch_size=cfg.batch_size)
     del anchor_model
 
-    # RL (SFT anchor로 self-critical)
-    # RL 단계: 선택된 알고리즘으로 학습
-    if getattr(args, "rl_alg", "grpo") == "grpo":
-        train_grpo(model, tr, dv, te, allowed_models, device, cfg,
-                   la_bias_eval=la_bias_tuned, anchor_precomputed=anchor_pre, args=args)
-    else:
-        # 기존 A2C가 필요하면 유지
-        train_rl(model, tr, dv, te, allowed_models, device, cfg,
-                 la_bias_eval=la_bias_tuned, anchor_precomputed=anchor_pre)
+    # GRPO
+    train_grpo(model, tr, dv, te, allowed_models, device, cfg,
+               la_bias_eval=la_bias_tuned, anchor_precomputed=anchor_pre, args=args)
 
-    # --- SFT 베스트 저장(옵션) ---
-    if args.save_sft:
-        os.makedirs(args.save_dir, exist_ok=True)
-        sft_bundle = {
-            "state_dict": sft_state,
-            "feature_stats": {
-                "aux_mean": aux_mean.tolist(),
-                "aux_std":  aux_std.tolist(),
-                "slm_mean": slm_mean.tolist(),
-                "slm_std":  slm_std.tolist(),
-            },
-            "la_bias": (la_bias_sft.tolist() if la_bias_sft is not None else None),
-            "model_names": allowed_models,
-            "bert": args.bert,
-            "max_len": args.max_len,
-            "freeze_bert": int(args.freeze_bert),
-            "tag": "SFT-best"
-        }
-        torch.save(sft_bundle, os.path.join(args.save_dir, sft_name))
-        print(f"[SAVE] SFT-best -> {os.path.join(args.save_dir, sft_name)}")
-
-    # --- RL 베스트 최종 저장 ---
+    # --- 저장 ---
     os.makedirs(args.save_dir, exist_ok=True)
+    # SFT
+    sft_name = args.sft_name if args.sft_name else "router_sft.pt"
+    torch.save({
+        "state_dict": sft_state,
+        "feature_stats": {
+            "aux_mean": aux_mean.tolist(),
+            "aux_std":  aux_std.tolist(),
+            "slm_mean": slm_mean.tolist(),
+            "slm_std":  slm_std.tolist(),
+        },
+        "la_bias": (la_bias_sft.tolist() if la_bias_sft is not None else None),
+        "model_names": allowed_models,
+        "bert": args.bert,
+        "max_len": args.max_len,
+        "freeze_bert": int(args.freeze_bert),
+        "tag": "SFT-best"
+    }, os.path.join(args.save_dir, sft_name))
+    print(f"[SAVE] SFT-best -> {os.path.join(args.save_dir, sft_name)}")
+
+    # RL
     final_bundle = {
         "state_dict": model.state_dict(),
         "feature_stats": {
@@ -1798,24 +1320,6 @@ def main():
     save_path = os.path.join(args.save_dir, args.save_name)
     torch.save(final_bundle, save_path)
     print(f"[SAVE] RL-best -> {save_path}")
-
-    # 집계 및 CSV
-    if args.results_csv:
-        sft_dev = compute_metrics(model, dv, allowed_models, device, batch_size=cfg.batch_size, la_bias=la_bias_tuned)
-        sft_test= compute_metrics(model, te, allowed_models, device, batch_size=cfg.batch_size, la_bias=la_bias_tuned)
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        row = {
-            "time": now, "seed": args.seed,
-            "sft_dev_action_acc": sft_dev["gold_action_acc"], "sft_dev_joint": sft_dev["gold_joint_acc"],
-            "sft_dev_macro_f1": sft_dev["action_macro_f1"],
-            "sft_test_action_acc": sft_test["gold_action_acc"], "sft_test_joint": sft_test["gold_joint_acc"],
-            "sft_test_macro_f1": sft_test["action_macro_f1"],
-            "label_source": args.label_source, "dist_mode": args.dist_mode,
-            "run_tag": run_tag, "sft_ckpt": sft_name, "rl_ckpt": args.save_name,
-        }
-        fields = list(row.keys())
-        append_results_csv(args.results_csv, row, fields)
-        print(f"[CSV] appended to {args.results_csv}")
 
 if __name__ == "__main__":
     main()
