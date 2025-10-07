@@ -5,7 +5,7 @@ set -euo pipefail
 # R3Route – Step0 (data generation) runner
 # --------------------------------------------
 # Usage:
-#   ./run_step0.sh [csqa|gsm8k|both] [PY=step0_CSQA.py]
+#   ./run_step0.sh [csqa|gsm8k|both] [PY=step0.py]
 # Env overrides (examples):
 #   CSQA_TOTAL=5000 CSQA_SEED=800 ./run_step0.sh csqa
 #   GSM_TOTAL=6000  GSM_SEED=1000 ./run_step0.sh gsm8k
@@ -15,7 +15,7 @@ export PYTHONUNBUFFERED=1
 
 # Positional args (with env fallbacks)
 TASK="${1:-${TASK:-csqa}}"
-PY="${2:-${PY:-step0_CSQA.py}}"
+PY="${2:-${PY:-step0.py}}"
 
 # ---------- CSQA ----------
 CSQA_TOTAL="${CSQA_TOTAL:-4000}"
