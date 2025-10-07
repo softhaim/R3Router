@@ -32,8 +32,6 @@ bash run_step2.sh
 
 ## Notes
 
-* The **SLM must be model index 0**. It is only valid for the **Retain/Continue** action (not for Revise/Rewrite).
-* Checkpoint files may include the frozen encoder weights, so sizes can be large.
 * Paths, model lists, and hyperparameters are specified in the provided shell scripts; adjust to your environment.
 
 ---
