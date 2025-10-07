@@ -1,92 +1,105 @@
+#!/usr/bin/env bash
 set -euo pipefail
-# 맨 위쪽 공통 설정 근처
+
+# ============================================
+# R3Route – Step0 (data generation) runner
+# --------------------------------------------
+# Usage:
+#   ./run_step0.sh [csqa|gsm8k|both] [PY=step0_CSQA.py]
+# Env overrides (examples):
+#   CSQA_TOTAL=5000 CSQA_SEED=800 ./run_step0.sh csqa
+#   GSM_TOTAL=6000  GSM_SEED=1000 ./run_step0.sh gsm8k
+# ============================================
+
 export PYTHONUNBUFFERED=1
 
-# ===== 사용자 설정(환경변수로 덮어쓰기 가능) =====
-PY=${PY:-step0_CSQA.py}
-TASK=${TASK:-csqa}        # both | csqa | gsm8k
+# Positional args (with env fallbacks)
+TASK="${1:-${TASK:-csqa}}"
+PY="${2:-${PY:-step0_CSQA.py}}"
 
-# CSQA
+# ---------- CSQA ----------
 CSQA_TOTAL="${CSQA_TOTAL:-4000}"
 CSQA_SEED="${CSQA_SEED:-500}"
 OUT_CSQA="${OUT_CSQA:-runs/csqa_train.jsonl}"
 BANK_CSQA="${BANK_CSQA:-banks/bank_csqa.jsonl}"
 
-# GSM8K
-GSM_NUM="${GSM_NUM:-4000}"
+# ---------- GSM8K ----------
+GSM_TOTAL="${GSM_TOTAL:-4000}"
+GSM_SEED="${GSM_SEED:-600}"
 OUT_GSM="${OUT_GSM:-runs/gsm8k_train.jsonl}"
-RET_BANK_GSM_READ="${RET_BANK_GSM_READ:-bank_dump.jsonl}"   # 참조(없어도 안전)
-RET_BANK_GSM_WRITE="${RET_BANK_GSM_WRITE:-bank_ret.jsonl}"   # 덤프
+BANK_GSM="${BANK_GSM:-banks/bank_gsm8k.jsonl}"
 
-# 공통(GPU/버퍼링)
+# ---------- GPU ----------
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
-export PYTHONUNBUFFERED=1  # tqdm 갱신 안정화
 
-# 디렉토리 준비(읽기용 파일의 dirname은 . 일 수 있지만 mkdir -p . 는 무해)
+# Dirs
 mkdir -p \
   "$(dirname "$OUT_CSQA")" \
   "$(dirname "$OUT_GSM")" \
   "$(dirname "$BANK_CSQA")" \
-  "$(dirname "$RET_BANK_GSM_WRITE")"
+  "$(dirname "$BANK_GSM")"
 
-echo "==== Config ===="
-echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "========== Step0 config =========="
+echo "PY=$PY"
 echo "TASK=$TASK"
-echo "[CSQA] total=$CSQA_TOTAL, seed=$CSQA_SEED, out=$OUT_CSQA, bank=$BANK_CSQA"
-echo "[GSM8K] num=$GSM_NUM, out=$OUT_GSM, ret_read=$RET_BANK_GSM_READ, ret_write=$RET_BANK_GSM_WRITE"
-echo "==============="
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "[CSQA] TOTAL=$CSQA_TOTAL, SEED=$CSQA_SEED, OUT=$OUT_CSQA, BANK=$BANK_CSQA"
+echo "[GSM8K] TOTAL=$GSM_TOTAL, SEED=$GSM_SEED, OUT=$OUT_GSM, BANK=$BANK_GSM"
+echo "==================================="
 
-run_csqa_seed () {
-  echo "[CSQA] Phase 1: seed bank build ($CSQA_SEED)"
+run_csqa() {
+  local remain=$(( CSQA_TOTAL - CSQA_SEED ))
+
+  echo "[CSQA] Phase 1/2 — seed bank ($CSQA_SEED)"
   python "$PY" \
     --task csqa \
     --csqa_offset 0 \
     --num_samples "$CSQA_SEED" \
     --out "$OUT_CSQA" \
     --bank_dump "$BANK_CSQA"
-}
 
-run_csqa_main () {
-  local REMAIN=$(( CSQA_TOTAL - CSQA_SEED ))
-  if (( REMAIN > 0 )); then
-    echo "[CSQA] Phase 2: train with retrieval (offset=$CSQA_SEED, num=$REMAIN)"
+  if (( remain > 0 )); then
+    echo "[CSQA] Phase 2/2 — main with retrieval (offset=$CSQA_SEED, num=$remain)"
     python "$PY" \
       --task csqa \
       --csqa_offset "$CSQA_SEED" \
-      --num_samples "$REMAIN" \
+      --num_samples "$remain" \
       --out "$OUT_CSQA" \
       --ret_bank "$BANK_CSQA" \
       --bank_dump "$BANK_CSQA"
   else
-    echo "[CSQA] Phase 2 skipped (REMAIN <= 0)"
+    echo "[CSQA] Phase 2/2 skipped (TOTAL <= SEED)"
   fi
 }
 
-run_gsm8k () {
-  echo "[GSM8K] Train using ret_bank=$RET_BANK_GSM_READ, dump to $RET_BANK_GSM_WRITE"
+run_gsm8k() {
+  local remain=$(( GSM_TOTAL - GSM_SEED ))
+
+  echo "[GSM8K] Phase 1/2 — seed bank ($GSM_SEED)"
   python "$PY" \
     --task gsm8k \
-    --num_samples "$GSM_NUM" \
+    --num_samples "$GSM_SEED" \
     --out "$OUT_GSM" \
-    --ret_bank "$RET_BANK_GSM_READ" \
-    --bank_dump "$RET_BANK_GSM_WRITE"
+    --bank_dump "$BANK_GSM"
+
+  if (( remain > 0 )); then
+    echo "[GSM8K] Phase 2/2 — main with retrieval (num=$remain)"
+    python "$PY" \
+      --task gsm8k \
+      --num_samples "$remain" \
+      --out "$OUT_GSM" \
+      --ret_bank "$BANK_GSM" \
+      --bank_dump "$BANK_GSM"
+  else
+    echo "[GSM8K] Phase 2/2 skipped (TOTAL <= SEED)"
+  fi
 }
 
 case "$TASK" in
-  csqa)
-    run_csqa_seed
-    run_csqa_main
-    ;;
-  gsm8k)
-    run_gsm8k
-    ;;
-  both)
-    run_csqa_seed
-    run_csqa_main
-    run_gsm8k
-    ;;
-  *)
-    echo "Unknown TASK=$TASK (use: both|csqa|gsm8k)"; exit 1;;
+  csqa)  run_csqa ;;
+  gsm8k) run_gsm8k ;;
+  both)  run_csqa; run_gsm8k ;;
+  *)     echo "Unknown TASK=$TASK (use: csqa|gsm8k|both)"; exit 1 ;;
 esac
 
-echo "All done."
+echo "Step0 done."
