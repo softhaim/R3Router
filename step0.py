@@ -954,6 +954,7 @@ def main():
 
     # CSQA
     ap.add_argument("--csqa_offset", type=int, default=0)
+    ap.add_argument("--gsm_offset", type=int, default=0)
 
     # UX
     ap.add_argument("--no_tqdm", action="store_true", help="disable tqdm progress bar")
@@ -976,10 +977,13 @@ def main():
     if args.bank_dump: ensure_dir(os.path.dirname(args.bank_dump) or ".")
 
     # Dataset
-    if args.task=="gsm8k":
-        ds=load_dataset("gsm8k","main")["train"][3000:3000+args.num_samples]
-        questions=ds["question"]; answers=ds["answer"]
-        total_n=len(questions)
+    if args.task == "gsm8k":
+        start = int(args.gsm_offset or 0)
+        end = start + int(args.num_samples)
+        base = load_dataset("gsm8k", "main")["train"]
+        ds = base.select(range(start, min(end, len(base))))
+        questions = ds["question"]; answers = ds["answer"]
+        total_n = len(questions)
     else:
         hf = load_dataset("commonsense_qa")["train"]
         start = max(0, int(args.csqa_offset))
@@ -1059,7 +1063,7 @@ def main():
         for i in range(total_n):
             try:
                 if args.task=="gsm8k":
-                    pid=f"gsm8k-{i:06d}"
+                    pid = f"gsm8k-{(int(args.gsm_offset or 0) + i):06d}"
                     prob=questions[i].strip()
                     gold= last_number(answers[i]) or answers[i].strip()
                     qtype=guess_qtype(prob)
